@@ -28,7 +28,7 @@ from yarl import URL
 
 from . import hdrs
 from .base_protocol import BaseProtocol
-from .helpers import DEBUG, NO_EXTENSIONS, BaseTimerContext
+from .helpers import DEBUG, NO_EXTENSIONS, BaseTimerContext, set_exception
 from .http_exceptions import (
     BadHttpMessage,
     BadStatusLine,
@@ -825,6 +825,14 @@ class HttpPayloadParser:
                         i = chunk.find(CHUNK_EXT, 0, pos)
                         if i >= 0:
                             size_b = chunk[:i]  # strip chunk-extensions
+                            # Verify no LF in the chunk-extension
+                            ext = chunk[i:pos]
+                            if b"\n" in ext:
+                                exc = BadHttpMessage(
+                                    f"Unexpected LF in chunk-extension: {ext!r}"
+                                )
+                                set_exception(self.payload, exc)
+                                raise exc
                         else:
                             size_b = chunk[:pos]
 
