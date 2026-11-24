@@ -1,8 +1,10 @@
 import os
 import pathlib
 import sys
+from concurrent.futures import ThreadPoolExecutor
 
 from setuptools import Extension, setup
+from setuptools.command.build_ext import build_ext
 
 if sys.version_info < (3, 6):
     raise RuntimeError("aiohttp 3.x requires Python 3.6+")
@@ -11,9 +13,10 @@ if sys.version_info < (3, 6):
 NO_EXTENSIONS: bool = bool(os.environ.get("AIOHTTP_NO_EXTENSIONS"))
 HERE = pathlib.Path(__file__).parent
 IS_GIT_REPO = (HERE / ".git").exists()
+IS_CPYTHON = sys.implementation.name == "cpython"
 
 
-if sys.implementation.name != "cpython":
+if not IS_CPYTHON:
     NO_EXTENSIONS = True
 
 
@@ -25,6 +28,50 @@ if IS_GIT_REPO and not (HERE / "vendor/llhttp/README.md").exists():
 
 
 # NOTE: makefile cythonizes all Cython modules
+
+_BROTLI_VENDOR = "aiohttp/_vendored/brotli_src"
+_brotli_extension = Extension(
+    "aiohttp._vendored._brotli",
+    sources=[
+        f"{_BROTLI_VENDOR}/python/_brotli.c",
+        f"{_BROTLI_VENDOR}/c/common/constants.c",
+        f"{_BROTLI_VENDOR}/c/common/context.c",
+        f"{_BROTLI_VENDOR}/c/common/dictionary.c",
+        f"{_BROTLI_VENDOR}/c/common/platform.c",
+        f"{_BROTLI_VENDOR}/c/common/shared_dictionary.c",
+        f"{_BROTLI_VENDOR}/c/common/transform.c",
+        f"{_BROTLI_VENDOR}/c/dec/bit_reader.c",
+        f"{_BROTLI_VENDOR}/c/dec/decode.c",
+        f"{_BROTLI_VENDOR}/c/dec/huffman.c",
+        f"{_BROTLI_VENDOR}/c/dec/prefix.c",
+        f"{_BROTLI_VENDOR}/c/dec/state.c",
+        f"{_BROTLI_VENDOR}/c/dec/static_init.c",
+        f"{_BROTLI_VENDOR}/c/enc/backward_references.c",
+        f"{_BROTLI_VENDOR}/c/enc/backward_references_hq.c",
+        f"{_BROTLI_VENDOR}/c/enc/bit_cost.c",
+        f"{_BROTLI_VENDOR}/c/enc/block_splitter.c",
+        f"{_BROTLI_VENDOR}/c/enc/brotli_bit_stream.c",
+        f"{_BROTLI_VENDOR}/c/enc/cluster.c",
+        f"{_BROTLI_VENDOR}/c/enc/command.c",
+        f"{_BROTLI_VENDOR}/c/enc/compound_dictionary.c",
+        f"{_BROTLI_VENDOR}/c/enc/compress_fragment.c",
+        f"{_BROTLI_VENDOR}/c/enc/compress_fragment_two_pass.c",
+        f"{_BROTLI_VENDOR}/c/enc/dictionary_hash.c",
+        f"{_BROTLI_VENDOR}/c/enc/encode.c",
+        f"{_BROTLI_VENDOR}/c/enc/encoder_dict.c",
+        f"{_BROTLI_VENDOR}/c/enc/entropy_encode.c",
+        f"{_BROTLI_VENDOR}/c/enc/fast_log.c",
+        f"{_BROTLI_VENDOR}/c/enc/histogram.c",
+        f"{_BROTLI_VENDOR}/c/enc/literal_cost.c",
+        f"{_BROTLI_VENDOR}/c/enc/memory.c",
+        f"{_BROTLI_VENDOR}/c/enc/metablock.c",
+        f"{_BROTLI_VENDOR}/c/enc/static_dict.c",
+        f"{_BROTLI_VENDOR}/c/enc/static_dict_lut.c",
+        f"{_BROTLI_VENDOR}/c/enc/static_init.c",
+        f"{_BROTLI_VENDOR}/c/enc/utf8_util.c",
+    ],
+    include_dirs=[f"{_BROTLI_VENDOR}/c/brotli_include"],
+)
 
 extensions = [
     Extension("aiohttp._websocket", ["aiohttp/_websocket.c"]),
@@ -42,11 +89,73 @@ extensions = [
     ),
     Extension("aiohttp._helpers", ["aiohttp/_helpers.c"]),
     Extension("aiohttp._http_writer", ["aiohttp/_http_writer.c"]),
+    _brotli_extension,
 ]
 
 
+class _ParallelCompileBuildExt(build_ext):
+    """Build the extensions, and the C sources of each one, in parallel.
+
+    The vendored Brotli extension has ~36 translation units; compiled one by
+    one they overrun the time budget of the QEMU-emulated wheel builds.
+    Same compiler, per-source arguments and object order as
+    ``CCompiler.compile``, so the linked result is unchanged. Only the
+    ``unix`` compiler is parallelised; MSVC builds are left alone.
+    """
+
+    def build_extensions(self) -> None:
+        compiler = self.compiler
+        workers = os.cpu_count() or 1
+        if compiler.compiler_type != "unix" or workers < 2:
+            super().build_extensions()
+            return
+
+        if not self.parallel:
+            self.parallel = workers
+
+        def _parallel_compile(
+            sources,
+            output_dir=None,
+            macros=None,
+            include_dirs=None,
+            debug=0,
+            extra_preargs=None,
+            extra_postargs=None,
+            depends=None,
+        ):
+            macros, objects, extra_postargs, pp_opts, build = compiler._setup_compile(
+                output_dir, macros, include_dirs, sources, depends, extra_postargs
+            )
+            cc_args = compiler._get_cc_args(pp_opts, debug, extra_preargs)
+
+            def _compile_one(obj):
+                try:
+                    src, ext = build[obj]
+                except KeyError:
+                    return
+                compiler._compile(obj, src, ext, cc_args, extra_postargs, pp_opts)
+
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                # Consume the results so a failed compile re-raises here.
+                list(executor.map(_compile_one, objects))
+            return objects
+
+        compiler.compile = _parallel_compile
+        try:
+            super().build_extensions()
+        finally:
+            del compiler.compile
+
+
 build_type = "Pure" if NO_EXTENSIONS else "Accelerated"
-setup_kwargs = {} if NO_EXTENSIONS else {"ext_modules": extensions}
+if IS_CPYTHON and NO_EXTENSIONS:
+    setup_kwargs = {"ext_modules": [_brotli_extension]}
+elif NO_EXTENSIONS:
+    setup_kwargs = {}
+else:
+    setup_kwargs = {"ext_modules": extensions}
+if IS_CPYTHON:
+    setup_kwargs["cmdclass"] = {"build_ext": _ParallelCompileBuildExt}
 
 print("*********************", file=sys.stderr)
 print("* {build_type} build *".format_map(locals()), file=sys.stderr)

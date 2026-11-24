@@ -2,6 +2,7 @@
 
 import asyncio
 import re
+import zlib
 from typing import Any, List
 from unittest import mock
 from urllib.parse import quote
@@ -14,6 +15,7 @@ import aiohttp
 from aiohttp import http_exceptions, streams
 from aiohttp.base_protocol import BaseProtocol
 from aiohttp.http_parser import (
+    DEFAULT_MAX_DECOMPRESS_SIZE,
     NO_EXTENSIONS,
     DeflateBuffer,
     HeadersParser,
@@ -459,6 +461,52 @@ def test_compression_unknown(parser) -> None:
     messages, upgrade, tail = parser.feed_data(text)
     msg = messages[0][0]
     assert msg.compression is None
+
+
+def _compression_bomb(encoding: str) -> bytes:
+    original = b"\x00" * (2 * DEFAULT_MAX_DECOMPRESS_SIZE)
+    if encoding == "br":
+        return brotli.compress(original, quality=1)
+    wbits = 16 + zlib.MAX_WBITS if encoding == "gzip" else zlib.MAX_WBITS
+    compressor = zlib.compressobj(wbits=wbits)
+    return compressor.compress(original) + compressor.flush()
+
+
+@pytest.mark.parametrize("encoding", ["deflate", "gzip", "br"])
+def test_compression_bomb_request_is_rejected(parser, encoding: str) -> None:
+    if encoding == "br" and brotli is None:
+        pytest.skip("brotli is not installed")
+    body = _compression_bomb(encoding)
+    assert len(body) < DEFAULT_MAX_DECOMPRESS_SIZE // 64
+    text = (
+        b"POST /test HTTP/1.1\r\n"
+        b"content-encoding: %s\r\n"
+        b"content-length: %d\r\n\r\n" % (encoding.encode(), len(body))
+    ) + body
+
+    messages, upgrade, tail = parser.feed_data(text)
+    payload = messages[0][1]
+
+    assert isinstance(payload.exception(), http_exceptions.ContentEncodingError)
+    assert sum(len(d) for d in payload._buffer) <= DEFAULT_MAX_DECOMPRESS_SIZE
+
+
+@pytest.mark.parametrize("encoding", ["deflate", "gzip", "br"])
+def test_compression_bomb_response_is_rejected(response, encoding: str) -> None:
+    if encoding == "br" and brotli is None:
+        pytest.skip("brotli is not installed")
+    body = _compression_bomb(encoding)
+    text = (
+        b"HTTP/1.1 200 OK\r\n"
+        b"content-encoding: %s\r\n"
+        b"content-length: %d\r\n\r\n" % (encoding.encode(), len(body))
+    ) + body
+
+    messages, upgrade, tail = response.feed_data(text)
+    payload = messages[0][1]
+
+    assert isinstance(payload.exception(), http_exceptions.ContentEncodingError)
+    assert sum(len(d) for d in payload._buffer) <= DEFAULT_MAX_DECOMPRESS_SIZE
 
 
 def test_url_connect(parser: Any) -> None:
@@ -1543,3 +1591,41 @@ class TestDeflateBuffer:
         dbuf.feed_eof()
 
         assert buf.at_eof()
+
+    async def test_decompress_size_limit(self, stream) -> None:
+        buf = aiohttp.FlowControlDataQueue(
+            stream, 2**16, loop=asyncio.get_event_loop()
+        )
+        dbuf = DeflateBuffer(buf, "deflate", max_decompress_size=1024)
+
+        original = b"A" * (2**20)
+        compressed = zlib.compress(original)
+
+        with pytest.raises(http_exceptions.ContentEncodingError):
+            dbuf.feed_data(compressed, len(compressed))
+
+    @pytest.mark.parametrize(
+        "chunk_size",
+        [1024, 2**14, 2**16],
+        ids=["1KB", "16KB", "64KB"],
+    )
+    async def test_streaming_decompress_large_payload(
+        self, stream, chunk_size: int
+    ) -> None:
+        original = b"A" * (3 * 2**20)
+        compressed = zlib.compress(original)
+
+        buf = aiohttp.FlowControlDataQueue(
+            stream, 2**16, loop=asyncio.get_event_loop()
+        )
+        dbuf = DeflateBuffer(buf, "deflate")
+
+        for i in range(0, len(compressed), chunk_size):
+            chunk = compressed[i : i + chunk_size]
+            dbuf.feed_data(chunk, len(chunk))
+
+        dbuf.feed_eof()
+
+        result = b"".join(d for d, _ in buf._buffer)
+        assert len(result) == len(original)
+        assert result == original
